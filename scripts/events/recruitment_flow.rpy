@@ -392,14 +392,14 @@ label recruitment_event_flow(event, worker):
         call screen recruitment_choice_screen(event_choices=processed_choices)
         $ chosen_choice_data = _return
         
-        # Check if no choice was made (from examining worker details or screen dismiss)
-        if not isinstance(chosen_choice_data, dict):
-            # User returned from worker details or closed screen - go back to choices
+        # Check if no choice was made (from examining worker details)
+        if chosen_choice_data is None:
+            # User returned from worker details - go back to choices
             jump recruitment_choice_loop
 
         if chosen_choice_data.get("_dismiss_recruitment", False):
             return
- 
+
     # Process the choice
     python:
         outcome_details = process_recruitment_choice(chosen_choice_data, event, worker)
