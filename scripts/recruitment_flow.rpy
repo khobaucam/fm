@@ -1,0 +1,483 @@
+# Recruitment Event Flow - Using proper Ren'Py dialogue and choice system
+
+label start_recruitment_system:
+    # Load events and workers using Python
+    # IMPORTANT: This label is entered via Jump from UI (not call_in_new_context).
+    # So we must NOT use renpy.return_statement() for early exits (it can break flow).
+    $ store._recruitment_abort = False
+    $ store._recruitment_abort_message = ""
+    python:
+        try:
+            recruitment_events = load_events_from_folder("data/events", subfolder="recruit")
+            renpy.log(f"RECRUITMENT: Loaded {len(recruitment_events)} recruitment events")
+            if not recruitment_events:
+                renpy.log(f"RECRUITMENT DEBUG: 0 events - check if data/events/recruit/*.json exist and paths (Windows uses backslash)")
+            
+            recruit_candidates = load_recruit_workers()
+            renpy.log(f"RECRUITMENT: Loaded {len(recruit_candidates)} recruit candidates: {[w.get('name', 'Unknown') for w in recruit_candidates]}")
+            
+            if not recruitment_events:
+                store._recruitment_abort = True
+                store._recruitment_abort_message = "No recruitment events found"
+            elif not recruit_candidates:
+                store._recruitment_abort = True
+                store._recruitment_abort_message = "No workers available for recruitment"
+            
+            # Filter events: only include events where the specific worker is available (if event requires specific worker)
+            available_events = []
+            _pg_check = getattr(store, "event_passes_player_gender_requirement", None)
+            _occurrences = getattr(store, "event_occurrences", {})
+            for event in recruitment_events:
+                if not event_is_visible_for_content_filter(event):
+                    renpy.log(f"Event {event.get('id')} filtered out - restricted by content preference")
+                    continue
+                # Respect player_gender_requirement (same gate the daily engine applies)
+                if callable(_pg_check) and not _pg_check(event):
+                    renpy.log(f"Event {event.get('id')} filtered out - player gender requirement not met")
+                    continue
+                # Optional store-state gate: "required_store_value" = {"var":..., "equals":...}
+                # or a list of such dicts (all must match). E.g. Kar/Kara's intro events
+                # only exist once the matching Lanista gender is chosen.
+                _state_ok = getattr(store, "worker_recruit_state_ok", None)
+                if callable(_state_ok) and not _state_ok(event):
+                    renpy.log(f"Event {event.get('id')} filtered out - required_store_value not met")
+                    continue
+                # Respect occurrence caps for authored one-shots (unlimited defaults True)
+                if not event.get("unlimited", True):
+                    _occ = _occurrences.get(event.get("id"), 0)
+                    if _occ >= event.get("max_occurrences", 1):
+                        renpy.log(f"Event {event.get('id')} filtered out - occurrence cap reached ({_occ})")
+                        continue
+                if event.get("random_worker", True):
+                    # Random worker events are always available
+                    available_events.append(event)
+                else:
+                    # Specific worker event - match by worker_name and/or specific_worker_images (OR)
+                    _has_filter = getattr(store, "_event_has_identity_filters", None)
+                    _match = getattr(store, "_worker_matches_event_identity", None)
+                    has_identity_filter = _has_filter(event) if callable(_has_filter) else False
+                    if has_identity_filter and callable(_match):
+                        worker_available = any(_match(w, event) for w in recruit_candidates)
+                        if worker_available:
+                            available_events.append(event)
+                            renpy.log(f"Event {event.get('id')} is available - matching candidate found")
+                        else:
+                            renpy.log(f"Event {event.get('id')} filtered out - no matching candidate")
+                    else:
+                        # Event has random_worker=false but no identity filter - include it anyway
+                        available_events.append(event)
+            
+            if not available_events:
+                renpy.log("No recruitment events available (all specific workers unavailable)")
+                store._recruitment_abort = True
+                store._recruitment_abort_message = "No recruitment events available"
+            
+            # IMPORTANT: Prioritize in this order:
+            # 1. Workers with specific events (highest priority)
+            # 2. JSON-defined workers (unique/encounter_only) without specific events
+            # 3. Procedural workers (lowest priority)
+            workers_with_events = []
+            json_defined_workers = []
+            procedural_workers = []
+            specific_event = None
+            
+            _match = getattr(store, "_worker_matches_event_identity", None)
+            for worker in recruit_candidates:
+                worker_name = worker.get("name", "")
+                is_procedural = worker.get("procedural", False)
+                has_specific_event = any(
+                    not event.get("random_worker", True)
+                    and callable(_match)
+                    and _match(worker, event)
+                    for event in available_events
+                )
+                
+                if has_specific_event:
+                    workers_with_events.append(worker)
+                elif is_procedural:
+                    procedural_workers.append(worker)
+                elif worker.get("event_recruit_only", False):
+                    # Only ever offered through their own specific event (e.g. Kar/Kara).
+                    # With that event unavailable they stay out of the generic pools.
+                    pass
+                else:
+                    # JSON-defined worker (unique or encounter_only) without specific event
+                    json_defined_workers.append(worker)
+            
+            # Generic fallback paths must never surface event-only recruits
+            # (Kar/Kara); the `or` guard keeps the degenerate all-event-only
+            # case from crashing on an empty pool.
+            _generic_candidates = [
+                w for w in recruit_candidates
+                if not (hasattr(w, "get") and w.get("event_recruit_only", False))
+            ] or recruit_candidates
+            # Prioritize in order: specific events > JSON-defined > procedural
+            if workers_with_events:
+                selected_worker, specific_event = select_weighted_specific_recruit(
+                    available_events,
+                    workers_with_events,
+                )
+                if selected_worker is None:
+                    selected_worker = random.choice(workers_with_events)
+                renpy.log(
+                    f"Selected weighted specific recruitment event: "
+                    f"{specific_event.get('id') if specific_event else 'fallback'} "
+                    f"for {selected_worker.get('name')}"
+                )
+            elif json_defined_workers:
+                selected_worker = random.choice(json_defined_workers)
+                renpy.log(f"Selected JSON-defined worker (no specific event): {selected_worker.get('name')}")
+            else:
+                selected_worker = random.choice(_generic_candidates)
+                renpy.log(f"Selected procedural worker: {selected_worker.get('name')}")
+            
+            worker_name = selected_worker.get("name", "")
+            
+            # Check if there's a specific event for this worker
+            if specific_event is None:
+                _match = getattr(store, "_worker_matches_event_identity", None)
+                _has_filter = getattr(store, "_event_has_identity_filters", None)
+                for event in available_events:
+                    if not event.get("random_worker", True):
+                        if callable(_has_filter) and _has_filter(event) and callable(_match) and _match(selected_worker, event):
+                            specific_event = event
+                            renpy.log(f"Found specific event {event.get('id')} for worker {worker_name}")
+                            break
+            
+            if specific_event:
+                # Use the specific event for this worker
+                selected_event = specific_event
+            else:
+                # No specific event - use a generic random worker event
+                generic_events = [e for e in available_events if e.get("random_worker", True)]
+                # Skip generic events whose worker_filter matches no current candidate
+                _filter_ok_events = []
+                for event in generic_events:
+                    if event.get("worker_filter"):
+                        if not get_filtered_recruit_workers(event, _generic_candidates):
+                            renpy.log(f"Event {event.get('id')} skipped today - no candidate passes its worker_filter")
+                            continue
+                    _filter_ok_events.append(event)
+                generic_events = _filter_ok_events
+                if not generic_events:
+                    renpy.log("No generic recruitment events available")
+                    store._recruitment_abort = True
+                    store._recruitment_abort_message = "No recruitment events available"
+                else:
+                    # Select random generic event based on weight
+                    total_weight = sum(event.get("weight", 1) for event in generic_events)
+                    r = random.random() * total_weight
+                    current_weight = 0
+                    selected_event = generic_events[0]  # fallback
+                    
+                    for event in generic_events:
+                        current_weight += event.get("weight", 1)
+                        if r <= current_weight:
+                            selected_event = event
+                            break
+                    
+                    # Constrain the candidate to the event's worker_filter and/or gender requirement
+                    candidate_pool = _generic_candidates
+                    if selected_event.get("worker_filter"):
+                        candidate_pool = get_filtered_recruit_workers(selected_event, candidate_pool)
+                    worker_gender_requirement = _event_worker_gender_requirement(selected_event)
+                    if worker_gender_requirement:
+                        candidate_pool = [w for w in candidate_pool if str(w.get("gender", "")).strip().lower() == worker_gender_requirement]
+                    if not candidate_pool:
+                        renpy.log(f"No workers available matching requirements for event {selected_event.get('id')} (gender requirement: {worker_gender_requirement})")
+                        store._recruitment_abort = True
+                        store._recruitment_abort_message = "No suitable workers available for this event"
+                    elif selected_worker not in candidate_pool:
+                        selected_worker = random.choice(candidate_pool)
+                        renpy.log(f"Re-selected worker {selected_worker.get('name')} to satisfy requirements of event {selected_event.get('id')}")
+            
+            # Store globally (only when recruitment succeeded)
+            if not store._recruitment_abort:
+                store.current_recruitment_event = selected_event
+                store.current_recruitment_worker = selected_worker
+            
+        except Exception as e:
+            renpy.log(f"Error in start_recruitment_system: {e}")
+            if not store._recruitment_abort:
+                store._recruitment_abort = True
+                store._recruitment_abort_message = "Recruitment system error"
+    
+    # If recruitment setup failed, notify and return safely to tavern.
+    if getattr(store, "_recruitment_abort", False):
+        $ renpy.log(f"RECRUITMENT: aborting start_recruitment_system: {getattr(store, '_recruitment_abort_message', '')}")
+        $ renpy.notify(getattr(store, "_recruitment_abort_message", "Recruitment error"))
+        $ store.in_recruitment = False
+        jump tavern_screen
+    
+    # Mark recruitment context active
+    $ store.in_recruitment = True
+
+    # Check if it's advanced or simple event
+    if "choices" in selected_event and selected_event.get("choices"):
+        call recruitment_event_flow(selected_event, selected_worker) from _call_recruitment_event_flow
+    else:
+        call recruitment_event_simple(selected_event, selected_worker) from _call_recruitment_event_simple
+    # Clear recruitment context, consume the day's attempt, and return to tavern
+    $ store.can_recruit_today = False
+    $ store.in_recruitment = False
+    jump tavern_screen
+
+label resume_content_filtered_recruitment:
+    $ _resume_event = getattr(store, "current_recruitment_event", None)
+    $ _resume_worker = getattr(store, "current_recruitment_worker", None)
+    # Revalidate the serialized context against the LOADED game state, not the
+    # session that suspended it: a load (or a roster change since suspension)
+    # may have made this offer stale.
+    python:
+        _resume_stale_reason = ""
+        if not _resume_event or not _resume_worker:
+            _resume_stale_reason = "missing context"
+        elif not recruitment_context_is_visible(_resume_event, _resume_worker):
+            _resume_stale_reason = "content filter"
+        else:
+            _rw_name = _resume_worker.get("name", "")
+            if any(hasattr(w, "get") and w.get("name") == _rw_name for w in (getattr(store, "workers", []) or [])):
+                _resume_stale_reason = "worker already recruited (%s)" % _rw_name
+            else:
+                _occ = getattr(store, "event_occurrences", {}) or {}
+                if not _resume_event.get("unlimited", True):
+                    if _occ.get(_resume_event.get("id"), 0) >= _resume_event.get("max_occurrences", 1):
+                        _resume_stale_reason = "occurrence cap reached (%s)" % _resume_event.get("id")
+        if _resume_stale_reason:
+            renpy.log("RECRUITMENT: resume rejected - %s" % _resume_stale_reason)
+            clear_restricted_recruitment_context("resume_stale_%s" % _resume_stale_reason.replace(" ", "_"))
+    if _resume_stale_reason:
+        jump tavern_screen
+    $ store.in_recruitment = True
+    if _resume_event.get("choices"):
+        call recruitment_event_flow(_resume_event, _resume_worker) from _call_resumed_recruitment_event_flow
+    else:
+        call recruitment_event_simple(_resume_event, _resume_worker) from _call_resumed_recruitment_event_simple
+    $ store.can_recruit_today = False
+    $ clear_restricted_recruitment_context("resume_complete")
+    jump tavern_screen
+
+label recruitment_event_flow(event, worker):
+    if not recruitment_context_is_visible(event, worker):
+        $ suspend_restricted_recruitment_context(event, worker, "serialized_advanced")
+        return
+
+    # Mark start of new conversation for history navigation
+    $ start_new_conversation()
+
+    # Set up the scene with background (worker-aware fallback chain)
+    python:
+        try:
+            current_bg = get_recruitment_image(worker, "background", event)
+        except Exception as e:
+            renpy.log(f"recruitment_event_flow get_recruitment_image failed: {e}")
+            current_bg = "images/event_bg.png"
+    scene expression current_bg with dissolve
+    show expression Solid("#00000080")  # Semi-transparent black overlay
+
+    # Calculate cost (uses current difficulty multiplier)
+    python:
+        comfort_level = get_effective_comfort_desired(worker)
+        daily_cost = comfort_level * get_difficulty_comfort_mult()
+        worker["daily_cost"] = daily_cost
+        
+        # Replace placeholders in description and dialogue
+        worker_name = worker.get("name", "Unknown")
+        description = event["description"].replace("[event_worker]", worker_name)
+        dialogue_text = event.get("dialogue", "").replace("[event_worker]", worker_name)
+        description = description.replace("[COST]", f"${daily_cost}")
+        dialogue_text = dialogue_text.replace("[COST]", f"${daily_cost}")
+        # Substitute player placeholders (parity with the main event engine)
+        description = description.replace("[player_title]", str(player_title)).replace("[player_name]", str(player_name))
+        dialogue_text = dialogue_text.replace("[player_title]", str(player_title)).replace("[player_name]", str(player_name))
+
+        # Prepare choices with cost replacement
+        choices = event.get("choices", [])
+        processed_choices = []
+        for choice in choices:
+            if not choice_is_visible_for_content_filter(choice):
+                continue
+            choice_text = choice.get("option", "Choice")
+            choice_text = choice_text.replace("[COST]", f"${daily_cost}")
+            choice_text = choice_text.replace("[player_title]", str(player_title)).replace("[player_name]", str(player_name))
+            choice_copy = choice.copy()
+            choice_copy["option"] = choice_text
+            processed_choices.append(choice_copy)
+        
+        # Split description into sentences/phrases
+        description_sentences = []
+        if description:
+            # Split by sentence endings (periods, exclamation marks, question marks)
+            # Keep the punctuation with the sentence
+            sentences = re.split(r'(?<=[.!?])\s+', description)
+            for sentence in sentences:
+                sentence = sentence.strip()
+                # Also split by double newlines if they exist
+                if '\n\n' in sentence:
+                    parts = sentence.split('\n\n')
+                    for part in parts:
+                        part = part.strip()
+                        if part:
+                            description_sentences.append(part)
+                elif sentence:
+                    description_sentences.append(sentence)
+        
+        # Split dialogue into sentences/phrases
+        dialogue_sentences = []
+        if dialogue_text:
+            # First split by double newlines (paragraph breaks)
+            paragraphs = dialogue_text.split('\n\n')
+            for para in paragraphs:
+                para = para.strip()
+                if para:
+                    # Remove quotes if they wrap the entire paragraph
+                    if para.startswith('"') and para.endswith('"'):
+                        para = para[1:-1]
+                    # Split by sentence endings (keep punctuation)
+                    sentences = re.split(r'(?<=[.!?])\s+', para)
+                    for sentence in sentences:
+                        sentence = sentence.strip()
+                        if sentence:
+                            dialogue_sentences.append(sentence)
+    
+    # Show the description sentences one by one
+    window show
+    if description_sentences:
+        python:
+            for sentence in description_sentences:
+                renpy.say(None, sentence)
+    
+    # Show the worker dialogue sentences one by one with speaker name
+    if dialogue_sentences:
+        python:
+            # Create a temporary character for the worker
+            worker_char = renpy.character.Character(worker_name, color="#ffdd88", what_italic=True)
+            for sentence in dialogue_sentences:
+                renpy.say(worker_char, sentence)
+    
+    # Hide window before showing choices
+    window hide
+    
+    # Loop to handle returning from worker details
+    label recruitment_choice_loop:
+        # Load guard: once a recruitment opens, the script stays parked on this
+        # label for the rest of the in-game day, so saves made later that day
+        # resume HERE and re-run the choice screen with the serialized context.
+        # A worker who is already on the roster must never be re-offered.
+        python:
+            try:
+                _stale_recruit_name = worker.get("name") if hasattr(worker, "get") else None
+            except NameError:
+                _stale_worker = getattr(store, "current_recruitment_worker", None)
+                _stale_recruit_name = _stale_worker.get("name") if hasattr(_stale_worker, "get") else None
+            _stale_recruit = bool(
+                _stale_recruit_name
+                and any(
+                    hasattr(w, "get") and w.get("name") == _stale_recruit_name
+                    for w in (getattr(store, "workers", None) or [])
+                )
+            )
+            if _stale_recruit:
+                purge_recruitment_transients("choice_loop_guard")
+                renpy.log(f"RECRUITMENT: {_stale_recruit_name} is already hired; dismissing stale recruitment screen")
+                # Drop the dangling recruitment_event_flow call frame; its
+                # return site may no longer resolve after a script update.
+                try:
+                    renpy.pop_call()
+                except Exception:
+                    pass
+        if _stale_recruit:
+            jump tavern_screen
+        # Show choices using the same system as regular events (like random_event_choice)
+        call screen recruitment_choice_screen(event_choices=processed_choices)
+        $ chosen_choice_data = _return
+        
+        # Check if no choice was made (from examining worker details)
+        if chosen_choice_data is None:
+            # User returned from worker details - go back to choices
+            jump recruitment_choice_loop
+
+        if chosen_choice_data.get("_dismiss_recruitment", False):
+            return
+
+    # Process the choice
+    python:
+        outcome_details = process_recruitment_choice(chosen_choice_data, event, worker)
+        outcome_message = outcome_details.get("message", "Something happened.")
+        outcome_type = outcome_details.get("outcome", "default")
+    
+    # Show the outcome using unified screen (like interactions)
+    call screen recruitment_outcome(message=outcome_message, event=event, outcome=outcome_type)
+    
+    return
+
+# Simple recruitment flow for legacy events
+label recruitment_event_simple(event, worker):
+    if not recruitment_context_is_visible(event, worker):
+        $ suspend_restricted_recruitment_context(event, worker, "serialized_simple")
+        return
+
+    # Mark start of new conversation for history navigation
+    $ start_new_conversation()
+
+    python:
+        try:
+            current_bg = get_recruitment_image(worker, "background", event)
+        except Exception as e:
+            renpy.log(f"recruitment_event_simple get_recruitment_image failed: {e}")
+            current_bg = "images/event_bg.png"
+    scene expression current_bg with dissolve
+    show expression Solid("#00000080")  # Semi-transparent black overlay
+    
+    python:
+        comfort_level = get_effective_comfort_desired(worker)
+        daily_cost = comfort_level * get_difficulty_comfort_mult()
+        worker["daily_cost"] = daily_cost
+        worker["comfort_level"] = comfort_level
+        worker_name = worker.get("name", "Unknown")
+        description = event["description"].replace("[event_worker]", worker_name)
+        description = description.replace("[COST]", f"${daily_cost}")
+        # Substitute player placeholders (parity with the main event engine)
+        description = description.replace("[player_title]", str(player_title)).replace("[player_name]", str(player_name))
+
+    window show
+    narrator "[description]"
+    window hide
+
+    # Loop so examining doesn't end the event (mirrors recruitment_choice_loop
+    # in the advanced flow) - it must not consume the day's recruitment attempt.
+    label recruitment_simple_choice_loop:
+        call screen recruitment_event_screen(event=event, worker=worker)
+        $ choice = _return
+
+        if choice == "examine":
+            window show
+            narrator "You examine [worker_name] carefully. They seem capable."
+            window hide
+            jump recruitment_simple_choice_loop
+
+    if choice == "recruit":
+        python:
+            # Add worker to the game using recruit_worker for proper tutorial tracking
+            if worker not in store.workers:
+                recruit_worker(worker)
+                outcome_msg = f"You successfully recruited {worker_name} for ${daily_cost} per day."
+            else:
+                outcome_msg = f"{worker_name} is already working for you."
+    else:
+        $ outcome_msg = "You politely decline their offer."
+    
+    # Show outcome using unified screen (like interactions)
+    # Use a dummy event structure for simple recruitment
+    python:
+        dummy_event = {
+            "background_image": event.get("background_image", "event_bg"),
+            "success_image": event.get("success_image", None),
+            "failure_image": event.get("failure_image", None)
+        }
+        # Determine outcome type (default to success for simple recruitment)
+        outcome_type = "success" if choice == "recruit" else "default"
+    
+    call screen recruitment_outcome(message=outcome_msg, event=dummy_event, outcome=outcome_type)
+    
+    return
